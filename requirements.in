@@ -1,0 +1,25 @@
+-f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+jax[tpu]
+libtpu-nightly
+numpy<2
+flax>=0.10.0
+chex
+optax
+wandb
+icecream
+tensorflow
+tensorflow-datasets
+ipykernel
+ipython
+mediapy
+tf-models-official
+absl-py
+jaxtyping
+ml-collections
+google-cloud-storage
+orbax-checkpoint >= 0.10
+einops
+seaborn
+gcsfs
+flax_orbax==0.1.4
+tyro
