@@ -101,7 +101,7 @@ class Dense(nn.Module):
 
     def setup(self):
         self.kernel = self.param(
-            "kernel", self.kernel_init, (self.input_dim, self.output_dim)
+            "weight", self.kernel_init, (self.input_dim, self.output_dim)
         )
         if self.use_bias:
             self.bias = self.param("bias", self.bias_init, (self.output_dim,))
@@ -124,7 +124,12 @@ class CausalSelfAttention(nn.Module):
             use_bias=self.config.bias,
         )
         self.c_proj = Dense(
-            self.config.n_embd, self.config.n_embd, use_bias=self.config.bias
+            self.config.n_embd,
+            self.config.n_embd,
+            use_bias=self.config.bias,
+            kernel_init=nn.initializers.normal(
+                stddev=0.02 / jnp.sqrt(2 * self.config.n_layer)
+            ),
         )
         self.resid_dropout = nn.Dropout(self.config.dropout)
 
@@ -141,7 +146,7 @@ class CausalSelfAttention(nn.Module):
         x = jax.nn.dot_product_attention(q, k, v, is_causal=True)
         x = x.reshape(B, T, self.config.n_embd)
         x = self.perturb("pre_proj", x)
-        x = self.c_proj(x) / jnp.sqrt(2 * self.config.n_layer)
+        x = self.c_proj(x)
         return self.resid_dropout(x, deterministic=not train)
 
 

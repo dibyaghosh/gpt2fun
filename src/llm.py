@@ -5,6 +5,16 @@ from jaxtyping import Array, Float, Int
 import src.transformer
 
 
+class Embed(nn.Embed):
+    def setup(self):
+        self.embedding = self.param(
+            "weight",
+            self.embedding_init,
+            (self.num_embeddings, self.features),
+            self.param_dtype,
+        )
+
+
 class LLM(nn.Module):
     transformer: src.transformer.Transformer
     width: int
@@ -13,27 +23,28 @@ class LLM(nn.Module):
     dtype: jnp.dtype
 
     def setup(self):
-        self.embedding = nn.Embed(
+        self.wte = Embed(
             self.vocab_size,
             self.width,
             dtype=self.dtype,
             embedding_init=nn.initializers.normal(stddev=0.02),
         )
-        self.ln_final = src.transformer.LayerNorm(self.width)
-        self.pos_emb = self.param(
-            "pos_emb",
-            nn.initializers.normal(stddev=0.02),
-            (1, self.max_seq_len, self.width),
+        self.wpe = Embed(
+            self.max_seq_len,
+            self.width,
+            dtype=self.dtype,
+            embedding_init=nn.initializers.normal(stddev=0.02),
         )
+        self.ln_f = src.transformer.LayerNorm(self.width)
 
     def __call__(self, tokens: Int[Array, "batch seq_len"], train: bool):
         batch, seq_len = tokens.shape
-        vocab_embeddings = self.embedding(tokens)
-        x = vocab_embeddings + self.pos_emb[:, :seq_len, :].astype(self.dtype)
-        assert x.dtype == self.dtype
+        vocab_embeddings = self.wte(tokens)
+        pos_embeddings = self.wpe(jnp.arange(seq_len))
+        x = vocab_embeddings + pos_embeddings
+
         x = self.transformer(x, train)
-        assert x.dtype == self.dtype
-        x = self.ln_final(x)
-        logits = self.embedding.attend(x)
+        x = self.ln_f(x)
+        logits = self.wte.attend(x)
         assert logits.dtype == self.dtype
         return logits

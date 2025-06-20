@@ -18,18 +18,46 @@ class Worker:
         return cls(jax.process_index(), jax.process_count())
 
 
-def _load_data_shard(file: epath.Path, *, worker: Worker, chunk_size: int):
-    with file.open(mode="rb") as f:
-        header = np.frombuffer(f.read(3 * 4), dtype=np.uint32)
+class DataShard:
+    def __init__(self, file: epath.PathLike):
+        self.file = epath.Path(file)
+        self.f = None
+
+    def __enter__(self):
+        self.f = self.file.open(mode="rb")
+        header = np.frombuffer(self.f.read(3 * 4), dtype=np.uint32)
         assert header[0] == 20240520
         assert header[1] == 1
-        num_tokens = header[2]
-        num_rounds = num_tokens // (chunk_size * worker.num_workers)
-        current_token = worker.worker_id * chunk_size
+        self.num_tokens = header[2]
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.f.close()
+        self.f = None
+
+    def __len__(self):
+        return self.num_tokens
+
+    def __getitem__(self, idx: slice | int):
+        assert self.f is not None, "File not open. Use with context manager."
+        if isinstance(idx, int):
+            return self[slice(idx, idx + 1)][0]
+        assert isinstance(idx, slice)
+        start = idx.start or 0
+        stop = idx.stop or len(self)
+        step = idx.step or 1
+        num_to_read = stop - start
+        self.f.seek(256 * 4 + start * 2)
+        return np.frombuffer(self.f.read(num_to_read * 2), dtype=np.uint16)[::step]
+
+
+def _load_data_shard(file: epath.Path, *, worker: Worker, chunk_size: int):
+    with DataShard(file) as shard:
         tokens = []
+        num_rounds = len(shard) // (chunk_size * worker.num_workers)
+        current_token = worker.worker_id * chunk_size
         for round in range(num_rounds):
-            f.seek(256 * 4 + current_token * 2)
-            tokens.append(np.frombuffer(f.read(chunk_size * 2), dtype=np.uint16))
+            tokens.append(shard[current_token : current_token + chunk_size])
             current_token += chunk_size * worker.num_workers
         return np.concatenate(tokens)
 
@@ -45,7 +73,7 @@ def load(
     num_shards = int(np.ceil(num_tokens / per_shard))
     assert num_tokens <= per_shard * num_shards
     buffer = np.zeros(num_tokens, dtype=np.uint16)
-    assert num_shards <= 1000, "Too many shards."
+    assert num_shards <= 1020, "Too many shards."
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = [
@@ -60,14 +88,13 @@ def load(
         start = 0
         for n, future in enumerate(futures):
             shard_data = future.result()
-            print(
-                f"Loaded shard {n + 1} of {len(futures)}: {start}-{start + shard_data.shape[0]} tokens"
-            )
             buffer[start : start + shard_data.shape[0]] = shard_data[
                 : len(buffer) - start
             ]
             start += shard_data.shape[0]
             del shard_data
+            print(f"Loaded shard {n + 1} of {len(futures)}: {start} tokens")
+
     return buffer[:start]
 
 

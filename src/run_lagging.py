@@ -105,48 +105,24 @@ def main(
             tx=tx,
         )
 
+    def loss_fn(state: src.utils.TrainState, tokens: jax.Array, params: dict):
+        logits = state.model_def.apply({"params": params}, tokens[:, :-1], train=True)
+        loss = (
+            optax.softmax_cross_entropy_with_integer_labels(logits, tokens[:, 1:])
+            .astype(jnp.float32)
+            .mean()
+        )
+        accuracy = (logits.argmax(axis=-1) == tokens[:, 1:]).mean()
+        return loss, {
+            "loss": loss,
+            "accuracy": accuracy,
+        }
+
     @functools.partial(jax.jit, in_shardings=(_rs, _ds), out_shardings=_rs)
     def train_step(state: src.utils.TrainState, tokens: jax.Array):
-        def loss_fn(params):
-            logits, intermediates = state.model_def.apply(
-                params,
-                tokens[:, :-1],
-                train=True,
-                capture_intermediates=True,
-                mutable=["intermediates"],
-            )
-            loss = (
-                optax.softmax_cross_entropy_with_integer_labels(logits, tokens[:, 1:])
-                .astype(jnp.float32)
-                .mean()
-            )
-            accuracy = (logits.argmax(axis=-1) == tokens[:, 1:]).mean()
-
-            intermediates = flax.traverse_util.flatten_dict(intermediates)
-            intermediates = {
-                "/".join(k[:-1]): jnp.linalg.norm(
-                    v[0].astype(jnp.float32), axis=-1
-                ).mean()
-                for k, v in intermediates.items()
-            }
-
-            return loss, {
-                "loss": loss,
-                "accuracy": accuracy,
-                **intermediates,
-            }
-
-        perturb_params = state.model_def.init(
-            jax.random.PRNGKey(0), jnp.ones((1, 1), dtype=jnp.int32), train=False
-        )["perturbations"]
-        perturb_params = jax.tree.map(lambda x: x.astype(jnp.float32), perturb_params)
-
-        (_, info), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-            {"params": state.params, "perturbations": perturb_params}
+        (_, info), grads = jax.value_and_grad(loss_fn, has_aux=True, argnums=2)(
+            state, tokens, state.params
         )
-
-        grads, intermediate_grads = grads["params"], grads["perturbations"]
-
         updates, new_opt_state = state.tx.update(
             updates=grads, state=state.opt_state, params=state.params
         )
@@ -155,23 +131,17 @@ def main(
         info["param_norm"] = optax.global_norm(state.params)
         info["lr"] = state.tx.schedules["lr"](state.step // grad_accum_steps)
         new_params = optax.apply_updates(state.params, updates)
-
-        grad_norms = jax.tree.map(optax.global_norm, grads)
-        intermediate_grad_norms = jax.tree.map(optax.global_norm, intermediate_grads)
-
-        info["grad_norms"] = grad_norms
-        info["intermediate_grad_norms"] = intermediate_grad_norms
-        info["param_norms"] = jax.tree.map(optax.global_norm, state.params)
-        info["update_norms"] = jax.tree.map(optax.global_norm, updates)
-
         state = state.replace(
             params=new_params, opt_state=new_opt_state, step=state.step + 1
         )
 
         return state, info
 
-    state = init_state(init_params)
+    @functools.partial(jax.jit, in_shardings=(_rs, _ds), out_shardings=_rs)
+    def eval_step(state: src.utils.TrainState, tokens: jax.Array):
+        return loss_fn(state, tokens, state.params)[1]
 
+    state = init_state(init_params)
     dataset = src.dataset.ShardedDataset(
         directory=data_dir,
         num_tokens=num_tokens,
@@ -211,6 +181,19 @@ def main(
             if meta_step % log_interval == 0 or step == num_steps:
                 log_all(infos, meta_step)
                 infos = []
+
+                eval_info = {}
+                for step_back in [0, 1, 4, 16, 64, 256, 1024]:
+                    eval_info.update(
+                        {
+                            f"{k}_back_{step_back}": v
+                            for k, v in eval_step(
+                                state, dataset[(step - step_back) % len(dataset)]
+                            ).items()
+                        }
+                    )
+                log_all([eval_info], meta_step)
+
             if (
                 save_dir is not None
                 and save_interval is not None
